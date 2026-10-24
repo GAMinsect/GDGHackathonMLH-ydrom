@@ -19,7 +19,7 @@ onMounted(async () => {
 	try {
 		// 1. Richiedi le chiavi al backend Rust
 		const api_keys = await invoke("my_get_api_keys", {});
-
+		console.log("Chiavi ricevute da Rust:", api_keys); // Aggiungi questo per debug
 		// 2. Inizializza Gemini con la chiave recuperata dal .env
 		ai = new GoogleGenAI({ apiKey: api_keys.GEMINI_API });
 
@@ -44,7 +44,7 @@ async function testGemma() {
 
 	try {
 		const response = await ai.models.generateContent({
-			model: "gemini-1.5-flash", // Usa il modello che hai testato e funzionante
+			model: "gemma-4-26b-a4b-it", // Usa il modello che hai testato e funzionante
 			contents: "Roses are red...",
 		});
 		gemmaResponse.value = response.text;

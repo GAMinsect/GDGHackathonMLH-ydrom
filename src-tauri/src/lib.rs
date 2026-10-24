@@ -27,8 +27,7 @@ fn my_get_api_keys() -> Value {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
-        .invoke_handler(tauri::generate_handler![my_get_api_keys])
+        .invoke_handler(tauri::generate_handler![greet, my_get_api_keys])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
