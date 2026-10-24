@@ -1,37 +1,56 @@
 <script setup>
-import { ref } from "vue";
+import { ref, onMounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { GoogleGenAI } from "@google/genai";
 
 const greetMsg = ref("");
 const name = ref("");
-
-// Nuove variabili per gestire la risposta di Gemma e lo stato di caricamento
 const gemmaResponse = ref("");
 const isLoading = ref(false);
 
-// Inizializza l'AI con la tua API Key (nota: per progetti reali in produzione andrebbe messa nel backend Rust)
+// Variabile di stato per bloccare il bottone finché l'API non è pronta
+const isApiReady = ref(false);
 
+// Dichiariamo l'istanza vuota, la riempiremo quando avremo la chiave
+let ai = null;
+
+// onMounted viene eseguito non appena la pagina è caricata
+onMounted(async () => {
+	try {
+		// 1. Richiedi le chiavi al backend Rust
+		const api_keys = await invoke("my_get_api_keys", {});
+
+		// 2. Inizializza Gemini con la chiave recuperata dal .env
+		ai = new GoogleGenAI({ apiKey: api_keys.GEMINI_API });
+
+		// 3. Sblocca il bottone nell'interfaccia
+		isApiReady.value = true;
+		console.log("API di Gemini inizializzata con successo!");
+	} catch (error) {
+		console.error("Errore nel recupero delle chiavi API:", error);
+		gemmaResponse.value = "Errore critico: Impossibile caricare le chiavi API.";
+	}
+});
 
 async function greet() {
 	greetMsg.value = await invoke("greet", { name: name.value });
 }
-let api_keys = await invoke("my_get_api_keys", {});
-const ai = new GoogleGenAI({apiKey: api_keys.GEMINI_API});
-// Funzione asincrona per chiamare Gemma senza bloccare il rendering di Vue
+
 async function testGemma() {
+	if (!ai) return; // Previene chiamate accidentali se l'API non è pronta
+
 	isLoading.value = true;
-	gemmaResponse.value = "Gemma sta pensando...";
+	gemmaResponse.value = "L'IA sta pensando...";
 
 	try {
 		const response = await ai.models.generateContent({
-			model: "gemma-4-26b-a4b-it", // Modello Gemma corretto
+			model: "gemini-1.5-flash", // Usa il modello che hai testato e funzionante
 			contents: "Roses are red...",
 		});
 		gemmaResponse.value = response.text;
 	} catch (error) {
-		console.error("Errore con Gemma:", error);
-		gemmaResponse.value = "Errore durante la connessione a Gemma. Controlla la console.";
+		console.error("Errore con l'IA:", error);
+		gemmaResponse.value = "Errore durante la connessione all'IA. Controlla la console.";
 	} finally {
 		isLoading.value = false;
 	}
@@ -66,8 +85,8 @@ async function testGemma() {
 
 		<!-- Nuova sezione per testare Gemma -->
 		<h2>Testa l'Intelligenza Artificiale</h2>
-		<button @click="testGemma" :disabled="isLoading">
-			{{ isLoading ? "Caricamento..." : "Chiedi a Gemma" }}
+		<button @click="testGemma" :disabled="isLoading || !isApiReady">
+			{{ isLoading ? "Caricamento..." : "Chiedi all'IA" }}
 		</button>
 
 		<!-- Mostra la risposta di Gemma -->
