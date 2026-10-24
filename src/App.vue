@@ -357,6 +357,59 @@ const activeBoxes = computed(() => {
 const criticalCount = computed(() => {
   return activeBoxes.value.filter((b) => b.severity === "CRITICAL").length;
 });
+
+async function saveCensoredDocument() {
+	if (!imageUrl.value) return;
+
+	try {
+		// 1. Carica l'immagine originale in memoria per ottenere le dimensioni reali
+		const img = new Image();
+		img.src = imageUrl.value;
+		await new Promise((resolve, reject) => {
+			img.onload = resolve;
+			img.onerror = reject;
+		});
+
+		// 2. Crea un canvas con la risoluzione nativa dell'immagine
+		const canvas = document.createElement("canvas");
+		canvas.width = img.naturalWidth || img.width;
+		canvas.height = img.naturalHeight || img.height;
+		const ctx = canvas.getContext("2d");
+
+		// 3. Disegna l'immagine di base sul canvas
+		ctx.drawImage(img, 0, 0);
+
+		// 4. Disegna i rettangoli neri definitivi sopra tutte le aree oscurate
+		ctx.fillStyle = "#000000";
+		activeBoxes.value.forEach((box) => {
+			if (boxStates[box.id]?.obscured) {
+				const [ymin, xmin, ymax, xmax] = box.box_2d;
+				// Converte le coordinate (0-1000 o 0-1) in frazione (0.0 - 1.0)
+				const factor = ymax <= 1.0 ? 1.0 : 0.001;
+
+				const x = xmin * factor * canvas.width;
+				const y = ymin * factor * canvas.height;
+				const w = (xmax - xmin) * factor * canvas.width;
+				const h = (ymax - ymin) * factor * canvas.height;
+
+				ctx.fillRect(x, y, w, h);
+			}
+		});
+
+		// 5. Esporta il canvas in Base64 PNG e invoca il popup di salvataggio in Rust
+		const censoredDataUrl = canvas.toDataURL("image/png");
+		const savedPath = await invoke("save_censored_image", {
+			base64Image: censoredDataUrl,
+		});
+
+		if (savedPath) {
+			alert(`Immagine censurata salvata con successo in:\n${savedPath}`);
+		}
+	} catch (error) {
+		console.error("Errore durante il salvataggio:", error);
+		alert("Errore durante il salvataggio dell'immagine: " + error);
+	}
+}
 </script>
 
 <template>
@@ -415,17 +468,20 @@ const criticalCount = computed(() => {
             </span>
           </div>
 
-          <div class="toolbar-buttons">
-            <button class="btn-action" @click="obscureAll" title="Nascondi tutte le aree suggerite">
-              🛡️ Oscura Tutto
-            </button>
-            <button class="btn-action outline" @click="revealAll" title="Mostra tutte le aree">
-              👁️ Mostra Tutto
-            </button>
-            <button class="btn-action danger" @click="resetAll">
-              ✕ Nuovo Documento
-            </button>
-          </div>
+			<div class="toolbar-buttons">
+				<button class="btn-action" @click="obscureAll" title="Nascondi tutte le aree suggerite">
+					🛡️ Oscura Tutto
+				</button>
+				<button class="btn-action outline" @click="revealAll" title="Mostra tutte le aree">
+					👁️ Mostra Tutto
+				</button>
+				<button class="btn-action save" @click="saveCensoredDocument" title="Esporta e salva l'immagine censurata">
+					💾 Salva Censurato
+				</button>
+				<button class="btn-action danger" @click="resetAll">
+					✕ Nuovo Documento
+				</button>
+			</div>
         </div>
 
         <!-- Scanning Loader Overlay -->
@@ -1091,5 +1147,14 @@ const criticalCount = computed(() => {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+.btn-action.save {
+	background-color: #059669;
+	color: #ffffff;
+}
+
+.btn-action.save:hover {
+	background-color: #047857;
 }
 </style>
