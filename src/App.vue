@@ -11,12 +11,13 @@ const gemmaResponse = ref("");
 const isLoading = ref(false);
 
 // Inizializza l'AI con la tua API Key (nota: per progetti reali in produzione andrebbe messa nel backend Rust)
-const ai = new GoogleGenAI({apiKey: "AQ.Ab8RN6IGK66EgBjiAscCUoM6TgHc3zQJi7xLzohUWY9Ry5Yr8A"});
+
 
 async function greet() {
 	greetMsg.value = await invoke("greet", { name: name.value });
 }
-
+let api_keys = await invoke("my_get_api_keys", {});
+const ai = new GoogleGenAI({apiKey: api_keys.GEMINI_API});
 // Funzione asincrona per chiamare Gemma senza bloccare il rendering di Vue
 async function testGemma() {
 	isLoading.value = true;
