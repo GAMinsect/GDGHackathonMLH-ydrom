@@ -863,6 +863,8 @@ async function saveCensoredDocument() {
   cursor: pointer;
   transition: background-color 0.15s, border-color 0.15s;
   z-index: 10;
+	resize: both;
+	overflow: auto;
 }
 
 .bounding-box.pii {
@@ -900,6 +902,8 @@ async function saveCensoredDocument() {
   justify-content: center;
   width: 100%;
   height: 100%;
+	resize: both;
+	overflow: auto;
 }
 
 .mask-label {
@@ -908,6 +912,8 @@ async function saveCensoredDocument() {
   color: #64748b;
   letter-spacing: 0.05em;
   user-select: none;
+	resize: both;
+	overflow: auto;
 }
 
 /* Interactive Hover Popover Tooltip */
