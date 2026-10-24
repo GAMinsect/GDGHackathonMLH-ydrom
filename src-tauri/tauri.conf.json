@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "ydrom",
+        "title": "ChiaroDoc",
         "width": 800,
         "height": 600
       }

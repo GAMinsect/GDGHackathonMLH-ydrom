@@ -2,8 +2,9 @@ use std::env;
 use std::fs;
 use dotenv::dotenv;
 use serde_json::{json, Value};
-use base64::{Engine as _, engine::general_purpose};
+use base64::{Engine as _, engine::general_purpose, engine::general_purpose::STANDARD};
 use rfd::FileDialog;
+
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -32,7 +33,7 @@ fn save_censored_image(base64_image: String) -> Result<Option<String>, String> {
         .unwrap_or(&base64_image);
 
     // Decodifica la stringa Base64 in byte
-    let image_bytes = general_purpose::STANDARD
+    let image_bytes = STANDARD
         .decode(base64_clean)
         .map_err(|e| format!("Errore di decodifica immagine: {}", e))?;
 
@@ -52,6 +53,33 @@ fn save_censored_image(base64_image: String) -> Result<Option<String>, String> {
         Ok(None)
     }
 }
+#[tauri::command]
+fn save_censored_pdf(base64_pdf: String) -> Result<Option<String>, String> {
+    // Il frontend invia base64 puro, ma tolgo l'intestazione "data:...;base64," se presente
+    let base64_clean = base64_pdf
+        .split(',')
+        .nth(1)
+        .unwrap_or(&base64_pdf);
+
+    let pdf_bytes = STANDARD
+        .decode(base64_clean)
+        .map_err(|e| format!("Errore di decodifica PDF: {}", e))?;
+
+    let file_path = FileDialog::new()
+        .set_title("Salva documento censurato")
+        .add_filter("Documento PDF", &["pdf"])
+        .set_file_name("documento_censurato.pdf")
+        .save_file();
+
+    if let Some(path) = file_path {
+        fs::write(&path, pdf_bytes)
+            .map_err(|e| format!("Errore durante il salvataggio del file: {}", e))?;
+        Ok(Some(path.display().to_string()))
+    } else {
+        // L'utente ha annullato la finestra di dialogo
+        Ok(None)
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -60,7 +88,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             my_get_api_keys,
-            save_censored_image
+            save_censored_image,
+            save_censored_pdf
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

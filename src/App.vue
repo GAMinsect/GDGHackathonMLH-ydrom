@@ -2,6 +2,17 @@
 import { ref, reactive, computed, onMounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { GoogleGenAI } from "@google/genai";
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
+import pdfWorkerUrl from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
+import { PDFDocument } from "pdf-lib";
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+
+// Limiti per il rendering dei PDF
+const MAX_PDF_PAGES = 30;
+const PDF_MAX_SCALE = 2.5;
+const PDF_MAX_SIDE_PX = 2400;
+const PDF_STEP_TIMEOUT_MS = 60000; // oltre questo tempo un passo del PDF viene considerato bloccato
 
 // Application State
 const isApiReady = ref(false);
@@ -12,6 +23,10 @@ const imageUrl = ref("");
 const imageFile = ref(null);
 const selectedBoxId = ref(null);
 const imageWrapperRef = ref(null);
+const pages = ref([]); // [{ dataUrl, pdfWidth?, pdfHeight? }]
+const currentPage = ref(0);
+const sourceType = ref("image"); // "image" | "pdf"
+const failedPages = ref([]); // indici (0-based) delle pagine la cui scansione è fallita
 
 // AI Instance
 let ai = null;
@@ -26,6 +41,25 @@ const boxStates = reactive({});
 const interaction = ref(null);
 let suppressNextClick = false;
 let manualBoxCounter = 1;
+let hoverClearTimer = null;
+
+// Gestione fluida dell'hover tra rettangolo e popup (evita che sparisca spostando il mouse)
+function onBoxMouseEnter(boxId) {
+	if (hoverClearTimer) {
+		clearTimeout(hoverClearTimer);
+		hoverClearTimer = null;
+	}
+	selectedBoxId.value = boxId;
+}
+
+function onBoxMouseLeave(boxId) {
+	if (hoverClearTimer) clearTimeout(hoverClearTimer);
+	hoverClearTimer = setTimeout(() => {
+		if (selectedBoxId.value === boxId) {
+			selectedBoxId.value = null;
+		}
+	}, 180);
+}
 
 // Context-aware Gemma 4 / Gemini Prompt
 const SCANNER_PROMPT = `
@@ -87,7 +121,6 @@ function normalizeBoxes(rawBoxes) {
 		)
 		.map((b, i) => {
 			let [ymin, xmin, ymax, xmax] = b.box_2d.map(Number);
-			// Se il modello restituisce coordinate 0.0-1.0, le convertiamo in 0-1000
 			if (Math.max(ymin, xmin, ymax, xmax) <= 1.0) {
 				ymin *= 1000;
 				xmin *= 1000;
@@ -132,84 +165,257 @@ onMounted(async () => {
 // File Ingestion Handler
 function onFileSelected(event) {
 	const file = event.target.files?.[0];
+	event.target.value = "";
 	if (!file) return;
-	loadImageFile(file);
+	loadFile(file);
 }
 
 function onFileDrop(event) {
 	event.preventDefault();
 	const file = event.dataTransfer.files?.[0];
 	if (!file) return;
-	loadImageFile(file);
+	loadFile(file);
+}
+
+function isPdfFile(file) {
+	return file.type === "application/pdf" || file.name?.toLowerCase().endsWith(".pdf");
+}
+
+function loadFile(file) {
+	if (isPdfFile(file)) {
+		loadPdfFile(file);
+	} else if (file.type.startsWith("image/")) {
+		loadImageFile(file);
+	} else {
+		alert("Formato non supportato. Carica un'immagine (PNG, JPG, WEBP) o un file PDF.");
+	}
 }
 
 function loadImageFile(file) {
 	imageFile.value = file;
 	const reader = new FileReader();
 	reader.onload = (e) => {
+		pages.value = [{ dataUrl: e.target.result }];
+		sourceType.value = "image";
+		failedPages.value = [];
+		currentPage.value = 0;
 		imageUrl.value = e.target.result;
-		scanDocumentImage();
+		scanPages();
 	};
 	reader.readAsDataURL(file);
 }
 
-// Convert Base64 and Call Vision AI
-async function scanDocumentImage() {
-	if (!ai || !imageUrl.value) return;
+// Evita che un passo di pdf.js resti appeso all'infinito
+function withTimeout(promise, ms, message) {
+	let timer;
+	const timeout = new Promise((_, reject) => {
+		timer = setTimeout(() => reject(new Error(message)), ms);
+	});
+	return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Renderizza ogni pagina del PDF in un'immagine PNG, poi avvia la scansione
+// Renderizza ogni pagina del PDF in un'immagine PNG, poi avvia la scansione
+async function loadPdfFile(file) {
+	isScanning.value = true;
+	scanStatus.value = "Apertura del PDF...";
+
+	let loadingTask = null; // Dichiarato qui per accedervi nel finally
+	let pdf = null;
+	const rendered = [];
+	try {
+		const data = new Uint8Array(await file.arrayBuffer());
+		loadingTask = pdfjsLib.getDocument({ data, isEvalSupported: false });
+
+		pdf = await withTimeout(
+			loadingTask.promise,
+			PDF_STEP_TIMEOUT_MS,
+			"Timeout nell'apertura del PDF."
+		);
+		console.log(`PDF aperto: ${pdf.numPages} pagine`);
+
+		if (pdf.numPages > MAX_PDF_PAGES) {
+			throw new Error(
+				`Il PDF ha ${pdf.numPages} pagine, il limite è ${MAX_PDF_PAGES}. Dividilo in più file.`
+			);
+		}
+
+		for (let n = 1; n <= pdf.numPages; n++) {
+			scanStatus.value = `Rendering pagina ${n} di ${pdf.numPages}...`;
+
+			// Micro-pausa per far respirare Vue ed evitare il blocco dell'interfaccia
+			await new Promise(resolve => setTimeout(resolve, 50));
+
+			const page = await withTimeout(
+				pdf.getPage(n),
+				PDF_STEP_TIMEOUT_MS,
+				`Timeout nel caricamento della pagina ${n}.`
+			);
+			const base = page.getViewport({ scale: 1 });
+			const scale = Math.min(PDF_MAX_SCALE, PDF_MAX_SIDE_PX / Math.max(base.width, base.height));
+			const viewport = page.getViewport({ scale });
+
+			const canvas = document.createElement("canvas");
+			canvas.width = Math.floor(viewport.width);
+			canvas.height = Math.floor(viewport.height);
+
+			const renderTask = page.render({
+				canvas,
+				canvasContext: canvas.getContext("2d"),
+				viewport,
+			});
+			try {
+				await withTimeout(
+					renderTask.promise,
+					PDF_STEP_TIMEOUT_MS,
+					`Timeout nel rendering della pagina ${n}.`
+				);
+			} catch (err) {
+				renderTask.cancel();
+				throw err;
+			}
+			console.log(`Pagina ${n}/${pdf.numPages} renderizzata (${canvas.width}x${canvas.height})`);
+
+			rendered.push({
+				dataUrl: canvas.toDataURL("image/png"),
+				pdfWidth: base.width,
+				pdfHeight: base.height,
+			});
+
+			// Libera la memoria della singola pagina
+			page.cleanup();
+		}
+	} catch (error) {
+		console.error("Errore durante la lettura del PDF:", error);
+		isScanning.value = false;
+		scanStatus.value = "";
+		alert("Impossibile leggere il PDF: " + (error?.message || error));
+		return;
+	} finally {
+		// FIX: Chiamare destroy() sul loadingTask invece che su pdf[cite: 1]
+		if (loadingTask) loadingTask.destroy();
+	}
+
+	imageFile.value = file;
+	pages.value = rendered;
+	sourceType.value = "pdf";
+	failedPages.value = [];
+	currentPage.value = 0;
+	imageUrl.value = rendered[0].dataUrl;
+	await scanPages();
+}
+
+// Cambio pagina nel viewer
+function goToPage(index) {
+	if (index < 0 || index >= pages.value.length) return;
+	currentPage.value = index;
+	imageUrl.value = pages.value[index].dataUrl;
+	selectedBoxId.value = null;
+}
+
+function boxPageNumber(box) {
+	return (box.page ?? 0) + 1;
+}
+
+function goToBoxPage(box) {
+	const index = box.page ?? 0;
+	if (index !== currentPage.value) {
+		goToPage(index);
+		selectedBoxId.value = box.id;
+	}
+}
+
+// Invia una singola pagina (immagine) al modello, con fallback tra i modelli disponibili
+async function analyzePage(dataUrl) {
+	const [header, rawBase64] = dataUrl.split(",");
+	const mimeType = header.match(/^data:(.*?);base64$/)?.[1] || "image/jpeg";
+
+	let response;
+	let lastError;
+	for (const model of GEMMA_MODELS) {
+		try {
+			response = await ai.models.generateContent({
+				model,
+				contents: [
+					{ inlineData: { data: rawBase64, mimeType } },
+					{ text: SCANNER_PROMPT },
+				],
+				config: { responseMimeType: "application/json" },
+			});
+			console.log(`Scansione completata con ${model}`);
+			break;
+		} catch (err) {
+			console.warn(`Modello ${model} non disponibile:`, err);
+			lastError = err;
+		}
+	}
+	if (!response) throw lastError;
+	return parseModelJson(response.text);
+}
+
+// Scansiona tutte le pagine caricate (1 per le immagini, N per i PDF)
+async function scanPages() {
+	if (!ai || !pages.value.length) {
+		isScanning.value = false;
+		scanStatus.value = "";
+		return;
+	}
 
 	isScanning.value = true;
-	scanStatus.value = "Gemma sta analizzando il contesto del documento...";
 	boxes.value = [];
+	failedPages.value = [];
+
+	const total = pages.value.length;
+	const collected = [];
+	const failed = [];
+	let context = "";
+	let summary = "";
+	let lastErrorMessage = "";
 
 	try {
-		const rawBase64 = imageUrl.value.split(",")[1];
-		const mimeType = imageFile.value?.type || "image/jpeg";
-
-		scanStatus.value = "Rilevamento aree critiche e dati sensibili...";
-
-		let response;
-		let lastError;
-		for (const model of GEMMA_MODELS) {
+		for (let i = 0; i < total; i++) {
+			scanStatus.value =
+				total > 1
+					? `Analisi pagina ${i + 1} di ${total}...`
+					: "Rilevamento aree critiche e dati sensibili...";
 			try {
-				response = await ai.models.generateContent({
-					model,
-					contents: [
-						{
-							inlineData: {
-								data: rawBase64,
-								mimeType: mimeType,
-							},
-						},
-						{ text: SCANNER_PROMPT },
-					],
-					config: {
-						responseMimeType: "application/json",
-					},
+				const result = await analyzePage(pages.value[i].dataUrl);
+				if (!context) {
+					context = result.detected_context || "";
+					summary = result.summary || "";
+				}
+				normalizeBoxes(result.boxes).forEach((b) => {
+					collected.push({ ...b, id: `p${i}_${b.id}`, page: i });
 				});
-				console.log(`Scansione completata con ${model}`);
-				break;
 			} catch (err) {
-				console.warn(`Modello ${model} non disponibile:`, err);
-				lastError = err;
+				console.error(`Errore durante la scansione della pagina ${i + 1}:`, err);
+				lastErrorMessage = err?.message || String(err);
+				failed.push(i);
 			}
 		}
-		if (!response) throw lastError;
 
-		const result = parseModelJson(response.text);
+		detectedContext.value = context || "Documento Contrattuale";
+		documentSummary.value =
+			(summary || "Analisi completata.") +
+			(total > 1 ? ` (${total} pagine analizzate)` : "");
+		boxes.value = collected;
+		failedPages.value = failed;
 
-		detectedContext.value = result.detected_context || "Documento Contrattuale";
-		documentSummary.value = result.summary || "Analisi completata con successo.";
-		boxes.value = normalizeBoxes(result.boxes);
-
-		boxes.value.forEach((b) => {
+		collected.forEach((b) => {
 			boxStates[b.id] = {
 				obscured: b.default_obscure ?? true,
 				hallucination: false,
 			};
 		});
-	} catch (error) {
-		console.error("Errore durante la scansione:", error);
-		alert("Errore durante la scansione con l'IA: " + error.message);
+
+		if (failed.length > 0) {
+			const list = failed.map((i) => i + 1).join(", ");
+			alert(
+				`Scansione non riuscita per ${failed.length === 1 ? "la pagina" : "le pagine"}: ${list}.\n` +
+				`Controllale e aggiungi le censure a mano prima di salvare.\n\n` +
+				`Dettaglio: ${lastErrorMessage}`
+			);
+		}
 	} finally {
 		isScanning.value = false;
 		scanStatus.value = "";
@@ -234,12 +440,20 @@ function getBoxStyle(box) {
 	};
 }
 
+// Se il box è molto vicino al bordo superiore dell'immagine, mostra il tooltip sotto
+function isNearTop(box) {
+	const ymin = box.box_2d[0];
+	const normalizedY = ymin <= 1.0 ? ymin * 1000 : ymin;
+	return normalizedY < 160;
+}
+
 // Add a new censoring rectangle via button
 function addManualBox() {
 	const offset = ((manualBoxCounter - 1) % 6) * 25;
 	const newId = `manual_${Date.now()}_${manualBoxCounter}`;
 	const newBox = {
 		id: newId,
+		page: currentPage.value,
 		box_2d: [380 + offset, 300 + offset, 440 + offset, 700 + offset],
 		label: `Censura Manuale #${manualBoxCounter}`,
 		category: "MANUAL",
@@ -330,7 +544,7 @@ function onGlobalMouseMove(event) {
 
 	const dx = (pixelDx / state.rect.width) * 1000;
 	const dy = (pixelDy / state.rect.height) * 1000;
-	const MIN_SIZE = 12; // Dimensione minima su scala 0-1000
+	const MIN_SIZE = 12;
 
 	if (state.type === "move") {
 		const [y1, x1, y2, x2] = state.startBox2d;
@@ -366,6 +580,7 @@ function onGlobalMouseMove(event) {
 			const newId = `manual_${Date.now()}_${manualBoxCounter}`;
 			const newBox = reactive({
 				id: newId,
+				page: currentPage.value,
 				box_2d: [ymin, xmin, Math.max(ymin + MIN_SIZE, ymax), Math.max(xmin + MIN_SIZE, xmax)],
 				label: `Censura Manuale #${manualBoxCounter}`,
 				category: "MANUAL",
@@ -412,6 +627,9 @@ function flagHallucination(boxId) {
 	if (boxStates[boxId]) {
 		boxStates[boxId].hallucination = true;
 		boxStates[boxId].obscured = false;
+		if (selectedBoxId.value === boxId) {
+			selectedBoxId.value = null;
+		}
 	}
 }
 
@@ -433,6 +651,11 @@ function revealAll() {
 
 function resetAll() {
 	imageUrl.value = "";
+	pages.value = [];
+	currentPage.value = 0;
+	sourceType.value = "image";
+	failedPages.value = [];
+	selectedBoxId.value = null;
 	imageFile.value = null;
 	boxes.value = [];
 	detectedContext.value = "";
@@ -475,6 +698,10 @@ function loadDemoSample() {
 	ctx.fillText("di aumentare il canone del 15% in caso di incremento costi generali.", 60, 580);
 
 	imageUrl.value = canvas.toDataURL("image/png");
+	pages.value = [{ dataUrl: imageUrl.value }];
+	currentPage.value = 0;
+	sourceType.value = "image";
+	failedPages.value = [];
 
 	boxes.value = [
 		{
@@ -526,30 +753,56 @@ const activeBoxes = computed(() => {
 	return boxes.value.filter((b) => !boxStates[b.id]?.hallucination);
 });
 
+// Box della sola pagina visualizzata
+const pageBoxes = computed(() => {
+	return activeBoxes.value.filter((b) => (b.page ?? 0) === currentPage.value);
+});
+
+// Numero di aree per ogni pagina (per il selettore pagine)
+const pageCounts = computed(() => {
+	return pages.value.map((_, i) => activeBoxes.value.filter((b) => (b.page ?? 0) === i).length);
+});
+
 const criticalCount = computed(() => {
 	return activeBoxes.value.filter((b) => b.severity === "CRITICAL").length;
 });
 
-async function saveCensoredDocument() {
-	if (!imageUrl.value) return;
+function dataUrlToBytes(dataUrl) {
+	const binary = atob(dataUrl.split(",")[1]);
+	const bytes = new Uint8Array(binary.length);
+	for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+	return bytes;
+}
 
-	try {
-		const img = new Image();
-		img.src = imageUrl.value;
-		await new Promise((resolve, reject) => {
-			img.onload = resolve;
-			img.onerror = reject;
-		});
+function bytesToBase64(bytes) {
+	let binary = "";
+	const chunk = 0x8000;
+	for (let i = 0; i < bytes.length; i += chunk) {
+		binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+	}
+	return btoa(binary);
+}
 
-		const canvas = document.createElement("canvas");
-		canvas.width = img.naturalWidth || img.width;
-		canvas.height = img.naturalHeight || img.height;
-		const ctx = canvas.getContext("2d");
+// Disegna i rettangoli neri sulla pagina indicata e restituisce il canvas
+async function renderCensoredCanvas(pageIndex) {
+	const img = new Image();
+	img.src = pages.value[pageIndex].dataUrl;
+	await new Promise((resolve, reject) => {
+		img.onload = resolve;
+		img.onerror = reject;
+	});
 
-		ctx.drawImage(img, 0, 0);
+	const canvas = document.createElement("canvas");
+	canvas.width = img.naturalWidth || img.width;
+	canvas.height = img.naturalHeight || img.height;
+	const ctx = canvas.getContext("2d");
 
-		ctx.fillStyle = "#000000";
-		activeBoxes.value.forEach((box) => {
+	ctx.drawImage(img, 0, 0);
+
+	ctx.fillStyle = "#000000";
+	activeBoxes.value
+		.filter((box) => (box.page ?? 0) === pageIndex)
+		.forEach((box) => {
 			if (boxStates[box.id]?.obscured) {
 				const [ymin, xmin, ymax, xmax] = box.box_2d;
 				const factor = ymax <= 1.0 ? 1.0 : 0.001;
@@ -563,6 +816,40 @@ async function saveCensoredDocument() {
 			}
 		});
 
+	return canvas;
+}
+
+// Costruisce un PDF fatto di sole immagini: il testo originale non resta nel file,
+// quindi i dati oscurati non sono recuperabili (niente testo selezionabile sotto i rettangoli).
+async function saveCensoredPdf() {
+	const pdfDoc = await PDFDocument.create();
+
+	for (let i = 0; i < pages.value.length; i++) {
+		const canvas = await renderCensoredCanvas(i);
+		const png = await pdfDoc.embedPng(dataUrlToBytes(canvas.toDataURL("image/png")));
+		const { pdfWidth, pdfHeight } = pages.value[i];
+		const page = pdfDoc.addPage([pdfWidth, pdfHeight]);
+		page.drawImage(png, { x: 0, y: 0, width: pdfWidth, height: pdfHeight });
+	}
+
+	const base64Pdf = bytesToBase64(await pdfDoc.save());
+	const savedPath = await invoke("save_censored_pdf", { base64Pdf });
+
+	if (savedPath) {
+		alert(`PDF censurato salvato con successo in:\n${savedPath}`);
+	}
+}
+
+async function saveCensoredDocument() {
+	if (!pages.value.length) return;
+
+	try {
+		if (sourceType.value === "pdf") {
+			await saveCensoredPdf();
+			return;
+		}
+
+		const canvas = await renderCensoredCanvas(0);
 		const censoredDataUrl = canvas.toDataURL("image/png");
 		const savedPath = await invoke("save_censored_image", {
 			base64Image: censoredDataUrl,
@@ -573,7 +860,7 @@ async function saveCensoredDocument() {
 		}
 	} catch (error) {
 		console.error("Errore durante il salvataggio:", error);
-		alert("Errore durante il salvataggio dell'immagine: " + error);
+		alert("Errore durante il salvataggio: " + error);
 	}
 }
 </script>
@@ -601,15 +888,16 @@ async function saveCensoredDocument() {
 				@drop="onFileDrop"
 			>
 				<div class="dropzone-icon">📄</div>
-				<h2>Carica o Trascina una Foto del Contratto</h2>
-				<p>Supporta foto da smartphone, screenshot e scansioni (PNG, JPG, WEBP)</p>
+				<h2>Carica o Trascina un Contratto (foto o PDF)</h2>
+				<p>Supporta foto, screenshot, scansioni (PNG, JPG, WEBP) e PDF multipagina</p>
 
+				<p v-if="isScanning" class="dropzone-status">{{ scanStatus }}</p>
 				<div class="upload-actions">
 					<label class="btn-primary">
-						📁 Scegli Immagine
+						📁 Scegli File
 						<input
 							type="file"
-							accept="image/*"
+							accept="image/*,application/pdf,.pdf"
 							style="display: none"
 							@change="onFileSelected"
 						/>
@@ -648,7 +936,7 @@ async function saveCensoredDocument() {
 						<button class="btn-action outline" @click="revealAll" title="Mostra tutte le aree">
 							👁️ Mostra Tutto
 						</button>
-						<button class="btn-action save" @click="saveCensoredDocument" title="Esporta e salva l'immagine censurata">
+						<button class="btn-action save" @click="saveCensoredDocument" title="Esporta e salva il documento censurato">
 							💾 Salva Censurato
 						</button>
 						<button class="btn-action danger" @click="resetAll">
@@ -660,6 +948,43 @@ async function saveCensoredDocument() {
 				<!-- Hint Banner -->
 				<div class="editor-hint">
 					💡 <strong>Suggerimento:</strong> Trascina i rettangoli per spostarli, usa i quadratini sui bordi per ridimensionarli, oppure clicca e trascina direttamente sul documento per disegnare una nuova censura.
+				</div>
+
+				<!-- Page Selector (PDF multipagina) -->
+				<div v-if="pages.length > 1" class="pager">
+					<button
+						class="btn-action outline"
+						:disabled="currentPage === 0"
+						@click="goToPage(currentPage - 1)"
+					>
+						◀
+					</button>
+					<div class="page-chips">
+						<button
+							v-for="(p, i) in pages"
+							:key="'page_' + i"
+							:class="[
+				'page-chip',
+				{
+					active: i === currentPage,
+					flagged: pageCounts[i] > 0,
+					failed: failedPages.includes(i),
+				},
+			]"
+							:title="failedPages.includes(i) ? 'Scansione non riuscita' : `${pageCounts[i]} aree`"
+							@click="goToPage(i)"
+						>
+							{{ i + 1 }}
+						</button>
+					</div>
+					<button
+						class="btn-action outline"
+						:disabled="currentPage === pages.length - 1"
+						@click="goToPage(currentPage + 1)"
+					>
+						▶
+					</button>
+					<span class="pager-label">Pagina {{ currentPage + 1 }} di {{ pages.length }}</span>
 				</div>
 
 				<!-- Scanning Loader Overlay -->
@@ -687,7 +1012,7 @@ async function saveCensoredDocument() {
 
 						<!-- Dynamic Bounding Boxes -->
 						<div
-							v-for="box in activeBoxes"
+							v-for="box in pageBoxes"
 							:key="box.id"
 							:style="getBoxStyle(box)"
 							:class="[
@@ -698,8 +1023,8 @@ async function saveCensoredDocument() {
                   'is-selected': selectedBoxId === box.id,
                 },
               ]"
-							@mouseenter="selectedBoxId = box.id"
-							@mouseleave="selectedBoxId = null"
+							@mouseenter="onBoxMouseEnter(box.id)"
+							@mouseleave="onBoxMouseLeave(box.id)"
 							@mousedown.stop="startBoxMove($event, box)"
 							@click.stop="onBoxClick(box.id)"
 						>
@@ -718,7 +1043,13 @@ async function saveCensoredDocument() {
 							></span>
 
 							<!-- Interactive Hover Tooltip -->
-							<div class="box-tooltip" @mousedown.stop @click.stop>
+							<div
+								:class="['box-tooltip', { 'tooltip-below': isNearTop(box) }]"
+								@mouseenter="onBoxMouseEnter(box.id)"
+								@mouseleave="onBoxMouseLeave(box.id)"
+								@mousedown.stop
+								@click.stop
+							>
 								<div class="tooltip-header">
                   <span :class="['category-badge', box.category.toLowerCase()]">
                     {{ box.category }}
@@ -731,13 +1062,13 @@ async function saveCensoredDocument() {
 								<div class="tooltip-actions">
 									<button
 										class="btn-tooltip-toggle"
-										@click="toggleObscure(box.id)"
+										@click.stop="toggleObscure(box.id)"
 									>
 										{{ boxStates[box.id]?.obscured ? "👁️ Mostra Testo" : "🛡️ Oscura" }}
 									</button>
 									<button
 										class="btn-tooltip-flag"
-										@click="flagHallucination(box.id)"
+										@click.stop="flagHallucination(box.id)"
 										title="Rimuovi questo rettangolo"
 									>
 										🗑️ Rimuovi
@@ -760,6 +1091,7 @@ async function saveCensoredDocument() {
 					<div
 						v-for="box in activeBoxes"
 						:key="'list_' + box.id"
+						@click="goToBoxPage(box)"
 						:class="[
               'box-item',
               box.category.toLowerCase(),
@@ -768,11 +1100,11 @@ async function saveCensoredDocument() {
                 'obscured': boxStates[box.id]?.obscured,
               },
             ]"
-						@mouseenter="selectedBoxId = box.id"
-						@mouseleave="selectedBoxId = null"
+						@mouseenter="onBoxMouseEnter(box.id)"
+						@mouseleave="onBoxMouseLeave(box.id)"
 					>
 						<div class="box-item-header">
-							<span class="box-item-title">{{ box.label }}</span>
+							<span class="box-item-title">{{ box.label }}<small v-if="pages.length > 1" class="box-page-tag"> · pag. {{ boxPageNumber(box) }}</small></span>
 							<span :class="['category-badge', box.category.toLowerCase()]">
                 {{ box.category }}
               </span>
@@ -804,24 +1136,49 @@ async function saveCensoredDocument() {
 	</main>
 </template>
 
+<!-- Reset globale per eliminare il margine bianco e bloccare lo scroll della finestra -->
+<!-- Reset globale per eliminare il margine bianco e bloccare lo scroll della finestra -->
+<style>
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+	margin: 0;
+	padding: 0;
+	width: 100%;
+	height: 100%;
+	overflow: hidden;
+	background-color: #003B3E; /* Sfondo principale molto più scuro */
+}
+</style>
+
 <style scoped>
 /* App Shell & Header */
 .app-shell {
-	min-height: 100vh;
+	height: 100vh;
+	max-height: 100vh;
+	width: 100vw;
+	overflow: hidden;
 	display: flex;
 	flex-direction: column;
-	background-color: #0f172a;
-	color: #f8fafc;
+	background-color: #003B3E; /* Sfondo principale molto più scuro */
+	color: #FFFFFF;
 	font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 
 .app-header {
+	flex-shrink: 0;
 	display: flex;
 	justify-content: space-between;
 	align-items: center;
-	padding: 1rem 2rem;
-	background-color: #1e293b;
-	border-bottom: 1px solid #334155;
+	padding: 0.85rem 1.5rem;
+	background-color: rgba(28, 28, 28, 0.15); /* Leggera ombra per staccare dal blu */
+	border-bottom: 1px solid #A2C4C9; /* Blu main per i bordi */
 }
 
 .brand {
@@ -834,12 +1191,12 @@ async function saveCensoredDocument() {
 	font-size: 1.25rem;
 	font-weight: 700;
 	margin: 0;
-	color: #ffffff;
+	color: #FFFFFF;
 }
 
 .brand-badge {
-	background-color: #6366f1;
-	color: #ffffff;
+	background-color: #A2C4C9; /* Blu main */
+	color: #FFFFFF;
 	font-size: 0.65rem;
 	font-weight: 800;
 	padding: 0.2rem 0.5rem;
@@ -855,23 +1212,24 @@ async function saveCensoredDocument() {
 }
 
 .status-pill.ready {
-	background-color: #064e3b;
-	color: #34d399;
+	background-color: #85D5A4; /* Verde conferma */
+	color: #FFFFFF;
 }
 
 .status-pill.error {
-	background-color: #7f1d1d;
-	color: #fca5a5;
+	background-color: #D26031; /* Rosso errore/pericolo */
+	color: #FFFFFF;
 }
 
 .status-pill.loading {
-	background-color: #334155;
-	color: #94a3b8;
+	background-color: #A2C4C9; /* Blu main */
+	color: #FFFFFF;
 }
 
 /* Dropzone Screen */
 .upload-container {
 	flex: 1;
+	min-height: 0;
 	display: flex;
 	align-items: center;
 	justify-content: center;
@@ -882,15 +1240,15 @@ async function saveCensoredDocument() {
 	max-width: 600px;
 	width: 100%;
 	padding: 3.5rem 2rem;
-	background-color: #1e293b;
-	border: 2px dashed #475569;
+	background-color: rgba(162, 196, 201, 0.1); /* Sfondo blu trasparente */
+	border: 2px dashed #A2C4C9; /* Blu main */
 	border-radius: 1.25rem;
 	text-align: center;
 	transition: border-color 0.2s;
 }
 
 .dropzone:hover {
-	border-color: #6366f1;
+	border-color: #FFF0DD; /* Bianco soft per l'hover */
 }
 
 .dropzone-icon {
@@ -902,12 +1260,14 @@ async function saveCensoredDocument() {
 	font-size: 1.4rem;
 	font-weight: 700;
 	margin-bottom: 0.5rem;
+	color: #FFFFFF;
 }
 
 .dropzone p {
-	color: #94a3b8;
+	color: #FFFFFF;
 	font-size: 0.9rem;
 	margin-bottom: 2rem;
+	opacity: 0.9;
 }
 
 .upload-actions {
@@ -917,8 +1277,8 @@ async function saveCensoredDocument() {
 }
 
 .btn-primary {
-	background-color: #6366f1;
-	color: white;
+	background-color: #A2C4C9; /* Blu main */
+	color: #FFFFFF;
 	padding: 0.75rem 1.5rem;
 	border-radius: 0.5rem;
 	font-weight: 600;
@@ -928,61 +1288,67 @@ async function saveCensoredDocument() {
 }
 
 .btn-primary:hover {
-	background-color: #4f46e5;
+	background-color: #FFF0DD; /* Bianco soft */
+	color: #1C1C1C; /* Testo nero per contrasto sull'hover chiaro */
 }
 
 .btn-secondary {
-	background-color: #334155;
-	color: #e2e8f0;
+	background-color: transparent;
+	color: #FFFFFF;
 	padding: 0.75rem 1.5rem;
 	border-radius: 0.5rem;
 	font-weight: 600;
 	cursor: pointer;
-	border: 1px solid #475569;
+	border: 1px solid #A2C4C9; /* Blu main */
 	transition: background-color 0.2s;
 }
 
 .btn-secondary:hover {
-	background-color: #475569;
+	background-color: rgba(162, 196, 201, 0.2);
 }
 
 /* Inspection Layout */
 .inspection-layout {
 	flex: 1;
+	min-height: 0;
 	display: grid;
 	grid-template-columns: 1fr 380px;
-	gap: 1.5rem;
-	padding: 1.5rem;
+	gap: 1.25rem;
+	padding: 1.25rem;
 	overflow: hidden;
 }
 
 .viewer-card {
+	min-height: 0;
+	height: 100%;
 	display: flex;
 	flex-direction: column;
-	background-color: #1e293b;
+	background-color: rgba(162, 196, 201, 0.1); /* Toni di blu */
 	border-radius: 1rem;
-	border: 1px solid #334155;
+	border: 1px solid #A2C4C9;
 	overflow: hidden;
 	position: relative;
 }
 
 .viewer-toolbar {
+	flex-shrink: 0;
 	display: flex;
 	justify-content: space-between;
 	align-items: center;
-	padding: 0.85rem 1.25rem;
-	background-color: #0f172a;
-	border-bottom: 1px solid #334155;
+	padding: 0.75rem 1.25rem;
+	background-color: rgba(28, 28, 28, 0.15);
+	border-bottom: 1px solid #A2C4C9;
 	flex-wrap: wrap;
 	gap: 0.5rem;
 }
 
 .editor-hint {
-	background-color: #172033;
-	color: #94a3b8;
+	flex-shrink: 0;
+	background-color: rgba(28, 28, 28, 0.2);
+	color: #FFFFFF;
 	font-size: 0.75rem;
 	padding: 0.45rem 1.25rem;
-	border-bottom: 1px solid #334155;
+	border-bottom: 1px solid #A2C4C9;
 }
 
 .context-info {
@@ -992,8 +1358,8 @@ async function saveCensoredDocument() {
 }
 
 .context-tag {
-	background-color: #312e81;
-	color: #a5b4fc;
+	background-color: #A2C4C9; /* Blu main */
+	color: #FFFFFF;
 	font-weight: 700;
 	font-size: 0.75rem;
 	padding: 0.25rem 0.6rem;
@@ -1003,7 +1369,7 @@ async function saveCensoredDocument() {
 
 .flags-count {
 	font-size: 0.85rem;
-	color: #fca5a5;
+	color: #D26031; /* Rosso per il pericolo/allarmi */
 	font-weight: 600;
 }
 
@@ -1014,8 +1380,8 @@ async function saveCensoredDocument() {
 }
 
 .btn-action {
-	background-color: #4338ca;
-	color: white;
+	background-color: #A2C4C9; /* Blu main */
+	color: #FFFFFF;
 	border: none;
 	padding: 0.4rem 0.8rem;
 	border-radius: 0.375rem;
@@ -1025,50 +1391,113 @@ async function saveCensoredDocument() {
 }
 
 .btn-action.add-box {
-	background-color: #2563eb;
-	color: #ffffff;
-}
-
-.btn-action.add-box:hover {
-	background-color: #1d4ed8;
+	background-color: #A2C4C9;
 }
 
 .btn-action.outline {
 	background-color: transparent;
-	border: 1px solid #475569;
-	color: #cbd5e1;
+	border: 1px solid #FFF0DD; /* Bianco soft */
+	color: #FFFFFF;
 }
 
 .btn-action.danger {
-	background-color: #7f1d1d;
-	color: #fca5a5;
+	background-color: #D26031; /* Rosso negazione/eliminazione */
+	color: #FFFFFF;
 }
 
 .btn-action.save {
-	background-color: #059669;
-	color: #ffffff;
+	background-color: #85D5A4; /* Verde conferma/salvataggio */
+	color: #FFFFFF;
 }
 
-.btn-action.save:hover {
-	background-color: #047857;
+/* Pager */
+.dropzone .dropzone-status {
+	margin: 0 0 1.25rem 0;
+	color: #FFF0DD;
+	font-weight: 600;
 }
 
-/* Image Stage & Dynamic Bounding Boxes */
+.pager {
+	flex-shrink: 0;
+	display: flex;
+	align-items: center;
+	gap: 0.6rem;
+	padding: 0.4rem 1.25rem;
+	background-color: rgba(28, 28, 28, 0.15);
+	border-bottom: 1px solid #A2C4C9;
+}
+
+.pager-label {
+	flex-shrink: 0;
+	font-size: 0.75rem;
+	color: #FFFFFF;
+}
+
+.page-chips {
+	flex: 1;
+	min-width: 0;
+	display: flex;
+	gap: 0.3rem;
+	overflow-x: auto;
+	padding: 0.15rem 0;
+}
+
+.page-chip {
+	flex-shrink: 0;
+	min-width: 2rem;
+	padding: 0.25rem 0.5rem;
+	background-color: transparent;
+	border: 1px solid #A2C4C9;
+	border-radius: 0.375rem;
+	color: #FFFFFF;
+	font-size: 0.75rem;
+	font-weight: 600;
+	cursor: pointer;
+}
+
+.page-chip.flagged {
+	border-color: #D26031; /* Rosso pericolo */
+}
+
+.page-chip.failed {
+	border-color: #D26031;
+	color: #D26031;
+}
+
+.page-chip.active {
+	background-color: #FFF0DD; /* Bianco soft per la pagina attiva */
+	border-color: #FFF0DD;
+	color: #1C1C1C; /* Testo nero su fondo chiaro */
+}
+
+.btn-action:disabled {
+	opacity: 0.4;
+	cursor: not-allowed;
+}
+
+.box-page-tag {
+	color: #FFFFFF;
+	font-weight: 500;
+	opacity: 0.8;
+}
+
+/* Image Stage & Bounding Boxes */
 .image-stage {
 	flex: 1;
+	min-height: 0;
 	display: flex;
 	justify-content: center;
-	align-items: flex-start;
-	padding: 1.5rem;
+	align-items: center;
+	padding: 1.25rem;
 	overflow: auto;
-	background-color: #090d16;
+	background-color: rgba(28, 28, 28, 0.4);
 }
 
 .image-wrapper {
 	position: relative;
 	display: inline-block;
 	max-width: 100%;
-	box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+	box-shadow: 0 10px 25px -5px rgba(28, 28, 28, 0.5);
 	border-radius: 0.375rem;
 	cursor: crosshair;
 	user-select: none;
@@ -1078,7 +1507,7 @@ async function saveCensoredDocument() {
 	display: block;
 	max-width: 100%;
 	height: auto;
-	max-height: 75vh;
+	max-height: calc(100vh - 220px);
 	user-select: none;
 	pointer-events: none;
 }
@@ -1095,34 +1524,34 @@ async function saveCensoredDocument() {
 }
 
 .bounding-box.pii {
-	border-color: #3b82f6;
-	background-color: rgba(59, 130, 246, 0.15);
+	border-color: #A2C4C9; /* Blu main */
+	background-color: rgba(162, 196, 201, 0.2);
 }
 
 .bounding-box.overreach {
-	border-color: #ef4444;
-	background-color: rgba(239, 68, 68, 0.2);
+	border-color: #D26031; /* Rosso pericolo */
+	background-color: rgba(210, 96, 49, 0.2);
 }
 
 .bounding-box.financial {
-	border-color: #f59e0b;
-	background-color: rgba(245, 158, 11, 0.15);
+	border-color: #FFF0DD; /* Bianco soft per attenzione */
+	background-color: rgba(255, 240, 221, 0.2);
 }
 
 .bounding-box.manual {
-	border-color: #a855f7;
-	background-color: rgba(168, 85, 247, 0.2);
+	border-color: #85D5A4; /* Verde per utente */
+	background-color: rgba(133, 213, 164, 0.2);
 }
 
 .bounding-box.is-selected {
-	outline: 2px solid #ffffff;
-	z-index: 25;
+	outline: 2px solid #FFFFFF;
+	z-index: 30;
 }
 
-/* Blackout State */
+/* Blackout State - Censure Nere */
 .bounding-box.is-obscured {
-	background-color: #000000 !important;
-	border-color: #475569 !important;
+	background-color: #1C1C1C !important; /* Nero */
+	border-color: #1C1C1C !important; /* Nero */
 	display: flex;
 	align-items: center;
 	justify-content: center;
@@ -1141,7 +1570,7 @@ async function saveCensoredDocument() {
 .mask-label {
 	font-size: 0.6rem;
 	font-weight: 800;
-	color: #64748b;
+	color: #FFFFFF;
 	letter-spacing: 0.05em;
 	user-select: none;
 }
@@ -1151,8 +1580,8 @@ async function saveCensoredDocument() {
 	position: absolute;
 	width: 9px;
 	height: 9px;
-	background-color: #ffffff;
-	border: 1.5px solid #0f172a;
+	background-color: #FFFFFF;
+	border: 1.5px solid #1C1C1C;
 	border-radius: 2px;
 	opacity: 0;
 	transition: opacity 0.15s;
@@ -1177,19 +1606,40 @@ async function saveCensoredDocument() {
 .box-tooltip {
 	display: none;
 	position: absolute;
-	bottom: calc(100% + 10px);
+	bottom: calc(100% + 8px);
 	left: 0;
-	background-color: #0f172a;
-	border: 1px solid #334155;
+	background-color: #1C1C1C; /* Nero per il tooltip */
+	border: 1px solid #A2C4C9; /* Bordo blu main */
 	border-radius: 0.5rem;
 	padding: 0.6rem 0.75rem;
 	min-width: 240px;
 	max-width: 300px;
-	color: #f8fafc;
-	box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
-	z-index: 40;
+	color: #FFFFFF; /* Testo bianco */
+	box-shadow: 0 10px 15px -3px rgba(28, 28, 28, 0.8);
+	z-index: 45;
 	pointer-events: auto;
 	cursor: default;
+}
+
+.box-tooltip::after {
+	content: "";
+	position: absolute;
+	top: 100%;
+	left: 0;
+	right: 0;
+	height: 14px;
+	background: transparent;
+}
+
+.box-tooltip.tooltip-below {
+	bottom: auto;
+	top: calc(100% + 8px);
+}
+
+.box-tooltip.tooltip-below::after {
+	top: auto;
+	bottom: 100%;
+	height: 14px;
 }
 
 .bounding-box:hover .box-tooltip,
@@ -1211,28 +1661,28 @@ async function saveCensoredDocument() {
 }
 
 .category-badge.pii {
-	background-color: #1e3a8a;
-	color: #93c5fd;
+	background-color: #A2C4C9;
+	color: #1C1C1C;
 }
 
 .category-badge.overreach {
-	background-color: #7f1d1d;
-	color: #fca5a5;
+	background-color: #D26031;
+	color: #FFFFFF;
 }
 
 .category-badge.financial {
-	background-color: #78350f;
-	color: #fde68a;
+	background-color: #FFF0DD;
+	color: #1C1C1C;
 }
 
 .category-badge.manual {
-	background-color: #581c87;
-	color: #e9d5ff;
+	background-color: #85D5A4;
+	color: #1C1C1C;
 }
 
 .severity-badge {
 	font-size: 0.6rem;
-	color: #94a3b8;
+	color: #FFF0DD;
 	font-weight: 600;
 }
 
@@ -1244,7 +1694,7 @@ async function saveCensoredDocument() {
 
 .tooltip-reason {
 	font-size: 0.7rem;
-	color: #cbd5e1;
+	color: #FFFFFF;
 	line-height: 1.3;
 	margin-bottom: 0.5rem;
 }
@@ -1256,10 +1706,10 @@ async function saveCensoredDocument() {
 
 .btn-tooltip-toggle {
 	flex: 1;
-	background-color: #3b82f6;
-	color: white;
+	background-color: #A2C4C9;
+	color: #1C1C1C;
 	border: none;
-	padding: 0.25rem 0.5rem;
+	padding: 0.3rem 0.5rem;
 	border-radius: 0.25rem;
 	font-size: 0.7rem;
 	font-weight: 600;
@@ -1267,10 +1717,10 @@ async function saveCensoredDocument() {
 }
 
 .btn-tooltip-flag {
-	background-color: #334155;
-	color: #fca5a5;
+	background-color: #D26031; /* Rosso */
+	color: #FFFFFF;
 	border: none;
-	padding: 0.25rem 0.5rem;
+	padding: 0.3rem 0.5rem;
 	border-radius: 0.25rem;
 	font-size: 0.7rem;
 	cursor: pointer;
@@ -1278,17 +1728,20 @@ async function saveCensoredDocument() {
 
 /* Sidebar Inspector */
 .inspector-sidebar {
-	background-color: #1e293b;
+	min-height: 0;
+	height: 100%;
+	background-color: rgba(162, 196, 201, 0.1);
 	border-radius: 1rem;
-	border: 1px solid #334155;
+	border: 1px solid #A2C4C9;
 	display: flex;
 	flex-direction: column;
 	overflow: hidden;
 }
 
 .inspector-header {
-	padding: 1.25rem;
-	border-bottom: 1px solid #334155;
+	flex-shrink: 0;
+	padding: 1.1rem 1.25rem;
+	border-bottom: 1px solid #A2C4C9;
 }
 
 .inspector-header h3 {
@@ -1299,13 +1752,14 @@ async function saveCensoredDocument() {
 
 .summary-text {
 	font-size: 0.8rem;
-	color: #94a3b8;
+	color: #FFFFFF;
 	line-height: 1.4;
 	margin: 0;
 }
 
 .box-list {
 	flex: 1;
+	min-height: 0;
 	overflow-y: auto;
 	padding: 1rem;
 	display: flex;
@@ -1314,15 +1768,16 @@ async function saveCensoredDocument() {
 }
 
 .box-item {
-	background-color: #0f172a;
-	border: 1px solid #334155;
+	flex-shrink: 0;
+	background-color: rgba(28, 28, 28, 0.2);
+	border: 1px solid #A2C4C9;
 	border-radius: 0.5rem;
 	padding: 0.75rem;
 	transition: border-color 0.2s;
 }
 
 .box-item.active {
-	border-color: #6366f1;
+	border-color: #FFF0DD; /* Bianco soft per la selezione */
 }
 
 .box-item-header {
@@ -1339,7 +1794,7 @@ async function saveCensoredDocument() {
 
 .box-item-reason {
 	font-size: 0.75rem;
-	color: #94a3b8;
+	color: #FFFFFF;
 	margin: 0 0 0.75rem 0;
 	line-height: 1.3;
 }
@@ -1356,13 +1811,13 @@ async function saveCensoredDocument() {
 	gap: 0.4rem;
 	font-size: 0.75rem;
 	cursor: pointer;
-	color: #cbd5e1;
+	color: #FFFFFF;
 }
 
 .btn-discard {
 	background: none;
 	border: none;
-	color: #f87171;
+	color: #D26031; /* Rosso negazione */
 	font-size: 0.7rem;
 	cursor: pointer;
 	text-decoration: underline;
@@ -1372,7 +1827,7 @@ async function saveCensoredDocument() {
 .scanning-overlay {
 	position: absolute;
 	inset: 0;
-	background-color: rgba(15, 23, 42, 0.75);
+	background-color: rgba(0, 59, 62, 0.85); /* Versione trasparente del nuovo sfondo scuro */
 	display: flex;
 	align-items: center;
 	justify-content: center;
@@ -1385,8 +1840,8 @@ async function saveCensoredDocument() {
 	left: 0;
 	right: 0;
 	height: 3px;
-	background: linear-gradient(90deg, transparent, #6366f1, #ec4899, transparent);
-	box-shadow: 0 0 15px #6366f1;
+	background: linear-gradient(90deg, transparent, #FFF0DD, #A2C4C9, transparent);
+	box-shadow: 0 0 15px #FFF0DD;
 	animation: scanMove 2s infinite ease-in-out;
 }
 
@@ -1397,18 +1852,18 @@ async function saveCensoredDocument() {
 }
 
 .scanner-card {
-	background-color: #1e293b;
+	background-color: #003B3E; /* Sfondo principale scuro */
 	padding: 1.5rem 2rem;
 	border-radius: 0.75rem;
 	text-align: center;
-	border: 1px solid #475569;
+	border: 1px solid #A2C4C9;
 }
 
 .spinner {
 	width: 32px;
 	height: 32px;
-	border: 3px solid #334155;
-	border-top-color: #6366f1;
+	border: 3px solid #A2C4C9;
+	border-top-color: #FFF0DD;
 	border-radius: 50%;
 	animation: spin 0.8s linear infinite;
 	margin: 0 auto 0.75rem auto;
